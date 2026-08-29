@@ -53,7 +53,7 @@ const standardsPageURL = "https://www.iaasb.org/standards-pronouncements?languag
 const pdfDirectory = "PDFs"
 
 // crawlerUserAgent identifies this program to the IAASB server.
-const crawlerUserAgent = "IAASB-Document-Crawler/1.0"
+const crawlerUserAgent = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
 // maximumWorkers controls how many publication pages can be processed concurrently.
 const maximumWorkers = 5
