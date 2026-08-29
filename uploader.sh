@@ -24,7 +24,7 @@ function main() { # Define the main function that contains all script logic
 		current_epoch=$(date +%s)                            # Get current time in epoch seconds
 		elapsed_seconds=$((current_epoch - last_push_epoch)) # Time since last push
 
-		find PDFs/ -type f -iname '*.pdf' -size +100M -delete # Remove all the files larger than 100 MB
+		find PDFs/ -type f -size +100M -print -delete # Remove all the files larger than 100 MB
 
 		changed_files_count=$(git status --porcelain -uall | wc -l)
 		# Get list of changed files from git and count them
