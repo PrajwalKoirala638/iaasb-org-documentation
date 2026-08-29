@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	// Import strings for string processing.
 	"strings"
-	// Import sync for protecting shared crawler data.
+	// Import sync to protect shared crawler state.
 	"sync"
 	// Import time to add delays between requests.
 	"time"
@@ -34,13 +34,16 @@ import (
 	"golang.org/x/net/html"
 )
 
-// standardsPageURLs contains all IAASB listing URL templates that should be crawled.
+// standardsPageURLs contains all IAASB standards and support resource listing URLs.
 var standardsPageURLs = []string{
-	// Crawl the IAASB support resources listing.
+	// Crawl the IAASB Support & Resources listing.
 	"https://www.iaasb.org/support-resources?language=399&page=%d",
-	// Crawl the IAASB standards and pronouncements listing.
+	// Crawl the IAASB Standards & Pronouncements listing.
 	"https://www.iaasb.org/standards-pronouncements?language=399&page=%d",
 }
+
+// pastMeetingsPageURL contains the paginated IAASB Past Meetings listing URL.
+const pastMeetingsPageURL = "https://www.iaasb.org/meetings/past-meetings?page=%d"
 
 // pdfDirectory is the directory where PDFs will be saved.
 const pdfDirectory = "PDFs"
@@ -48,15 +51,15 @@ const pdfDirectory = "PDFs"
 // crawlerUserAgent identifies this program to the IAASB server.
 const crawlerUserAgent = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
-// maximumWorkers controls the maximum number of concurrent workers.
+// maximumWorkers controls the maximum number of workers available for future concurrent processing.
 const maximumWorkers = 5
 
-// requestDelay controls the delay between requests.
+// requestDelay controls the delay between HTTP requests.
 const requestDelay = 750 * time.Millisecond
 
 // httpClient is the shared HTTP client used by the crawler.
 var httpClient = &http.Client{
-	// Set a reasonable timeout for each HTTP request.
+	// Set a reasonable timeout for every HTTP request.
 	Timeout: 2 * time.Minute,
 }
 
@@ -82,19 +85,19 @@ var invalidFilenameCharacters = strings.NewReplacer(
 	"*", "_",
 )
 
-// Publication represents one IAASB publication page.
+// Publication represents one IAASB publication or meeting page.
 type Publication struct {
-	// URL contains the publication page URL.
+	// URL contains the page URL.
 	URL string
-	// Title contains the publication title.
+	// Title contains the page title.
 	Title string
 }
 
-// PDFDocument represents one PDF discovered on a publication page.
+// PDFDocument represents one PDF discovered on an IAASB page.
 type PDFDocument struct {
 	// URL contains the PDF download URL.
 	URL string
-	// SourcePageURL contains the publication page where the PDF was found.
+	// SourcePageURL contains the page where the PDF was found.
 	SourcePageURL string
 	// FileName contains the desired local filename.
 	FileName string
@@ -104,7 +107,7 @@ type PDFDocument struct {
 type IAASBCrawler struct {
 	// OutputDirectory contains the directory where PDFs are stored.
 	OutputDirectory string
-	// VisitedPublicationPages contains publication URLs already scraped.
+	// VisitedPublicationPages contains pages already scraped.
 	VisitedPublicationPages map[string]struct{}
 	// ProcessedPDFURLs contains PDF URLs already processed.
 	ProcessedPDFURLs map[string]struct{}
@@ -114,20 +117,20 @@ type IAASBCrawler struct {
 
 // createCrawler creates a new IAASB crawler.
 func createCrawler(outputDirectory string) *IAASBCrawler {
-	// Return a crawler with initialized in-memory state.
+	// Return a crawler with initialized state.
 	return &IAASBCrawler{
 		// Set the PDF output directory.
 		OutputDirectory: outputDirectory,
-		// Create the set used to track scraped publication pages.
+		// Create the visited page set.
 		VisitedPublicationPages: make(map[string]struct{}),
-		// Create the set used to track processed PDF URLs.
+		// Create the processed PDF URL set.
 		ProcessedPDFURLs: make(map[string]struct{}),
 	}
 }
 
 // main starts the IAASB crawler.
 func main() {
-	// Create the PDFs directory if it does not already exist.
+	// Create the PDFs directory when it does not already exist.
 	if err := os.MkdirAll(pdfDirectory, 0o755); err != nil {
 		// Log the directory creation error.
 		slog.Error("unable to create PDF directory", "error", err)
@@ -138,10 +141,18 @@ func main() {
 	// Create the IAASB crawler.
 	crawler := createCrawler(pdfDirectory)
 
-	// Start crawling all IAASB listing pages.
+	// Crawl the Support & Resources and Standards & Pronouncements pages.
 	if err := crawler.crawlStandardsPages(); err != nil {
-		// Log the crawler error.
-		slog.Error("crawler failed", "error", err)
+		// Log the standards crawler error.
+		slog.Error("standards crawler failed", "error", err)
+		// Exit with a failure status.
+		os.Exit(1)
+	}
+
+	// Crawl the IAASB Past Meetings pages.
+	if err := crawler.crawlPastMeetings(); err != nil {
+		// Log the meetings crawler error.
+		slog.Error("past meetings crawler failed", "error", err)
 		// Exit with a failure status.
 		os.Exit(1)
 	}
@@ -150,19 +161,19 @@ func main() {
 	slog.Info("IAASB crawler completed successfully")
 }
 
-// crawlStandardsPages visits all IAASB listing pages until no new publications are found.
+// crawlStandardsPages visits all configured IAASB standards and support resource listings.
 func (crawler *IAASBCrawler) crawlStandardsPages() error {
-	// Keep track of every unique publication URL found during this entire run.
+	// Keep one shared set so duplicate pages across both IAASB listings are not processed twice.
 	knownPublicationPages := make(map[string]struct{})
 
-	// Process every IAASB listing URL template.
+	// Process every configured IAASB listing URL.
 	for _, standardsPageURL := range standardsPageURLs {
-		// Start crawling at page zero for the current listing.
+		// Start crawling at page zero.
 		pageNumber := 0
 
-		// Continue crawling the current listing until no new publications are found.
+		// Continue until the current listing contains no new publication URLs.
 		for {
-			// Build the current IAASB listing URL.
+			// Build the current listing URL.
 			currentPageURL := fmt.Sprintf(standardsPageURL, pageNumber)
 
 			// Log the listing page being visited.
@@ -175,54 +186,123 @@ func (crawler *IAASBCrawler) crawlStandardsPages() error {
 				return fmt.Errorf("find publications on page %d: %w", pageNumber, err)
 			}
 
-			// Count how many new publication URLs were found.
+			// Count the new publication pages found on this listing page.
 			newPublicationCount := 0
 
-			// Process publications in the order they were discovered.
+			// Process every publication found on the current listing page.
 			for _, publication := range publications {
-				// Check whether this publication URL was already discovered.
+				// Check whether this publication was already discovered on either listing.
 				if _, exists := knownPublicationPages[publication.URL]; exists {
-					// Skip the duplicate publication URL.
+					// Skip the duplicate publication.
 					continue
 				}
 
-				// Remember this publication URL across both listing sections.
+				// Remember this publication URL globally for this run.
 				knownPublicationPages[publication.URL] = struct{}{}
 
 				// Increment the new publication counter.
 				newPublicationCount++
 
-				// Immediately visit the publication and download its PDFs.
+				// Visit the publication immediately and download its PDFs.
 				if err := crawler.processPublication(publication); err != nil {
-					// Log the error but continue with the remaining publications.
+					// Log the error while continuing with other publications.
 					slog.Error("failed to process publication", "title", publication.Title, "url", publication.URL, "error", err)
 				}
 			}
 
-			// Log the results for the current listing page.
+			// Log the current listing page results.
 			slog.Info("IAASB listing page completed", "page", pageNumber, "url", currentPageURL, "publications_on_page", len(publications), "new_publications", newPublicationCount, "total_unique_publications", len(knownPublicationPages))
 
-			// Stop this listing when the page contains no new publication URLs.
+			// Stop the current listing when no new publication pages were found.
 			if newPublicationCount == 0 {
-				// Log the stopping condition.
-				slog.Info("no new publication URLs found; moving to next listing", "page", pageNumber, "url", currentPageURL)
-				// Stop crawling the current listing.
+				// Log that this listing has finished.
+				slog.Info("no new publication URLs found; moving to next listing", "url", currentPageURL)
+				// Stop crawling this listing.
 				break
 			}
 
-			// Move to the next IAASB listing page.
+			// Move to the next listing page.
 			pageNumber++
 
-			// Wait before requesting the next listing page.
+			// Wait before making another request.
 			time.Sleep(requestDelay)
 		}
 	}
 
-	// Return successfully after processing every listing.
+	// Return successfully after processing both listing sources.
 	return nil
 }
 
-// findPublicationsOnListingPage extracts publication URLs from one listing page.
+// crawlPastMeetings visits every paginated IAASB Past Meetings listing.
+func (crawler *IAASBCrawler) crawlPastMeetings() error {
+	// Keep track of every unique meeting URL discovered during this run.
+	knownMeetingPages := make(map[string]struct{})
+
+	// Start at the first Past Meetings page.
+	pageNumber := 0
+
+	// Continue until a Past Meetings page contains no new meetings.
+	for {
+		// Build the current Past Meetings URL.
+		currentPageURL := fmt.Sprintf(pastMeetingsPageURL, pageNumber)
+
+		// Log the Past Meetings page being visited.
+		slog.Info("visiting IAASB Past Meetings page", "page", pageNumber, "url", currentPageURL)
+
+		// Find every meeting page on the current listing.
+		meetings, err := crawler.findMeetingsOnListingPage(currentPageURL)
+		if err != nil {
+			// Return the Past Meetings listing error.
+			return fmt.Errorf("find meetings on page %d: %w", pageNumber, err)
+		}
+
+		// Count new meeting pages found on this page.
+		newMeetingCount := 0
+
+		// Process every meeting discovered on the current page.
+		for _, meeting := range meetings {
+			// Check whether this meeting page was already discovered.
+			if _, exists := knownMeetingPages[meeting.URL]; exists {
+				// Skip the duplicate meeting.
+				continue
+			}
+
+			// Remember this meeting page globally.
+			knownMeetingPages[meeting.URL] = struct{}{}
+
+			// Increment the new meeting counter.
+			newMeetingCount++
+
+			// Visit the meeting page and download every PDF immediately.
+			if err := crawler.processPublication(meeting); err != nil {
+				// Log the error while continuing with other meetings.
+				slog.Error("failed to process meeting", "title", meeting.Title, "url", meeting.URL, "error", err)
+			}
+		}
+
+		// Log the current Past Meetings page results.
+		slog.Info("IAASB Past Meetings page completed", "page", pageNumber, "url", currentPageURL, "meetings_on_page", len(meetings), "new_meetings", newMeetingCount, "total_unique_meetings", len(knownMeetingPages))
+
+		// Stop when the current page contains no new meetings.
+		if newMeetingCount == 0 {
+			// Log that Past Meetings crawling has finished.
+			slog.Info("no new meeting URLs found; stopping Past Meetings crawler", "url", currentPageURL)
+			// Stop crawling Past Meetings.
+			break
+		}
+
+		// Move to the next Past Meetings page.
+		pageNumber++
+
+		// Wait before requesting the next page.
+		time.Sleep(requestDelay)
+	}
+
+	// Return successfully.
+	return nil
+}
+
+// findPublicationsOnListingPage extracts publication URLs from one standards or support listing page.
 func (crawler *IAASBCrawler) findPublicationsOnListingPage(listingPageURL string) ([]Publication, error) {
 	// Download the listing page.
 	responseBody, err := crawler.fetchURL(listingPageURL)
@@ -260,37 +340,32 @@ func (crawler *IAASBCrawler) findPublicationsOnListingPage(listingPageURL string
 
 		// Check whether the current node is an anchor element.
 		if currentNode.Type == html.ElementNode && currentNode.Data == "a" {
-			// Convert the anchor attributes into a map.
+			// Convert anchor attributes into a map.
 			attributes := convertAttributesToMap(currentNode.Attr)
 
-			// Read the anchor's CSS class.
+			// Read the anchor CSS class.
 			anchorClass := attributes["class"]
 
-			// Look specifically for IAASB publication card links.
-			if strings.Contains(anchorClass, "card__link-wrap") {
-				// Read the publication URL.
-				rawPublicationURL := strings.TrimSpace(attributes["href"])
+			// Read the anchor URL.
+			rawPublicationURL := strings.TrimSpace(attributes["href"])
 
-				// Convert the relative URL into an absolute URL.
+			// Process IAASB publication card links.
+			if strings.Contains(anchorClass, "card__link-wrap") && rawPublicationURL != "" {
+				// Resolve the publication URL against the listing URL.
 				absolutePublicationURL, resolveError := resolveURL(listingPageURL, rawPublicationURL)
 
 				// Process only valid IAASB publication URLs.
 				if resolveError == nil && isIAASBPublicationURL(absolutePublicationURL) {
-					// Check whether the URL was already found on this page.
+					// Check whether this URL was already found on this page.
 					if _, exists := foundPublicationURLs[absolutePublicationURL]; !exists {
-						// Remember this publication URL.
+						// Remember the publication URL.
 						foundPublicationURLs[absolutePublicationURL] = struct{}{}
 
 						// Extract the publication title.
 						publicationTitle := strings.TrimSpace(extractNodeText(currentNode))
 
 						// Add the publication to the result.
-						publications = append(publications, Publication{
-							// Store the publication URL.
-							URL: absolutePublicationURL,
-							// Store the publication title.
-							Title: publicationTitle,
-						})
+						publications = append(publications, Publication{URL: absolutePublicationURL, Title: publicationTitle})
 					}
 				}
 			}
@@ -310,118 +385,67 @@ func (crawler *IAASBCrawler) findPublicationsOnListingPage(listingPageURL string
 	return publications, nil
 }
 
-// processPublication visits one publication page and downloads its PDFs immediately.
-func (crawler *IAASBCrawler) processPublication(publication Publication) error {
-	// Mark this publication page as visited.
-	if !crawler.markPublicationPageVisited(publication.URL) {
-		// Do not scrape the same page twice.
-		return nil
-	}
-
-	// Log the publication being visited.
-	slog.Info("visiting publication page", "title", publication.Title, "url", publication.URL)
-
-	// Download the publication page.
-	responseBody, err := crawler.fetchURL(publication.URL)
+// findMeetingsOnListingPage extracts meeting page URLs from an IAASB Past Meetings page.
+func (crawler *IAASBCrawler) findMeetingsOnListingPage(listingPageURL string) ([]Publication, error) {
+	// Download the Past Meetings listing page.
+	responseBody, err := crawler.fetchURL(listingPageURL)
 	if err != nil {
 		// Return the HTTP error.
-		return err
+		return nil, err
 	}
 
-	// Close the publication page response.
+	// Close the response body after parsing it.
 	defer responseBody.Close()
 
-	// Parse the publication HTML.
+	// Parse the HTML document.
 	htmlDocument, err := html.Parse(responseBody)
 	if err != nil {
-		// Return the parsing error.
-		return fmt.Errorf("parse publication page: %w", err)
+		// Return the HTML parsing error.
+		return nil, fmt.Errorf("parse Past Meetings HTML: %w", err)
 	}
 
-	// Find all PDFs on this publication page.
-	pdfDocuments := findPDFDocuments(htmlDocument, publication.URL)
+	// Store meetings discovered on this page.
+	var meetings []Publication
 
-	// Log how many PDFs were found.
-	slog.Info("PDFs found on publication page", "title", publication.Title, "count", len(pdfDocuments))
+	// Prevent duplicate meeting URLs on this page.
+	foundMeetingURLs := make(map[string]struct{})
 
-	// Download each PDF immediately.
-	for _, pdfDocument := range pdfDocuments {
-		// Check whether this PDF URL has already been processed.
-		if !crawler.markPDFURLProcessed(pdfDocument.URL) {
-			// Log that the PDF URL was already processed.
-			slog.Info("PDF URL already processed; skipping", "url", pdfDocument.URL)
-			// Continue with the next PDF.
-			continue
-		}
-
-		// Download the PDF if it is not already stored locally.
-		if err := crawler.downloadPDFIfMissing(pdfDocument); err != nil {
-			// Log the PDF error.
-			slog.Error("failed to download PDF", "url", pdfDocument.URL, "error", err)
-		}
-	}
-
-	// Return successfully.
-	return nil
-}
-
-// findPDFDocuments extracts PDF resources from a publication page.
-func findPDFDocuments(htmlDocument *html.Node, sourcePageURL string) []PDFDocument {
-	// Store discovered PDF documents.
-	var pdfDocuments []PDFDocument
-
-	// Prevent duplicate PDF URLs on this page.
-	foundPDFURLs := make(map[string]struct{})
-
-	// Define the recursive HTML walker.
+	// Define the recursive HTML tree walker.
 	var walkHTML func(*html.Node)
 
-	// Define the HTML walker.
+	// Define the HTML tree walker.
 	walkHTML = func(currentNode *html.Node) {
-		// Stop when there is no node.
+		// Stop when the node is nil.
 		if currentNode == nil {
 			// Stop processing this branch.
 			return
 		}
 
-		// Only inspect anchor elements.
+		// Inspect anchor elements.
 		if currentNode.Type == html.ElementNode && currentNode.Data == "a" {
-			// Convert HTML attributes into a map.
+			// Convert anchor attributes into a map.
 			attributes := convertAttributesToMap(currentNode.Attr)
 
-			// IAASB commonly stores PDF URLs in data-file-url.
-			rawPDFURL := strings.TrimSpace(attributes["data-file-url"])
+			// Read the anchor URL.
+			rawMeetingURL := strings.TrimSpace(attributes["href"])
 
-			// Fall back to href when data-file-url is unavailable.
-			if rawPDFURL == "" {
-				// Read the href attribute.
-				rawPDFURL = strings.TrimSpace(attributes["href"])
-			}
+			// Process non-empty meeting links.
+			if rawMeetingURL != "" {
+				// Resolve the meeting URL against the Past Meetings URL.
+				absoluteMeetingURL, resolveError := resolveURL(listingPageURL, rawMeetingURL)
 
-			// Ignore empty links.
-			if rawPDFURL != "" {
-				// Resolve the PDF URL against the publication page.
-				absolutePDFURL, resolveError := resolveURL(sourcePageURL, rawPDFURL)
+				// Process only valid IAASB meeting detail pages.
+				if resolveError == nil && isIAASBMeetingURL(absoluteMeetingURL) {
+					// Check whether this meeting URL was already found on this page.
+					if _, exists := foundMeetingURLs[absoluteMeetingURL]; !exists {
+						// Remember the meeting URL.
+						foundMeetingURLs[absoluteMeetingURL] = struct{}{}
 
-				// Check whether the URL looks like an IAASB PDF resource.
-				if resolveError == nil && isPDFURL(absolutePDFURL) {
-					// Check whether this PDF URL already appeared on this page.
-					if _, exists := foundPDFURLs[absolutePDFURL]; !exists {
-						// Remember this PDF URL.
-						foundPDFURLs[absolutePDFURL] = struct{}{}
+						// Extract the meeting title.
+						meetingTitle := strings.TrimSpace(extractNodeText(currentNode))
 
-						// Create the local PDF filename.
-						fileName := createPDFFilename(absolutePDFURL, extractNodeText(currentNode))
-
-						// Add the PDF to the result.
-						pdfDocuments = append(pdfDocuments, PDFDocument{
-							// Store the PDF URL.
-							URL: absolutePDFURL,
-							// Store the source page URL.
-							SourcePageURL: sourcePageURL,
-							// Store the local filename.
-							FileName: fileName,
-						})
+						// Add the meeting to the result.
+						meetings = append(meetings, Publication{URL: absoluteMeetingURL, Title: meetingTitle})
 					}
 				}
 			}
@@ -434,7 +458,131 @@ func findPDFDocuments(htmlDocument *html.Node, sourcePageURL string) []PDFDocume
 		}
 	}
 
-	// Start walking the HTML document.
+	// Start walking the parsed Past Meetings HTML.
+	walkHTML(htmlDocument)
+
+	// Return all meetings found on the page.
+	return meetings, nil
+}
+
+// processPublication visits one IAASB page and downloads its PDFs immediately.
+func (crawler *IAASBCrawler) processPublication(publication Publication) error {
+	// Mark this page as visited.
+	if !crawler.markPublicationPageVisited(publication.URL) {
+		// Do not scrape the same page twice.
+		return nil
+	}
+
+	// Log the page being visited.
+	slog.Info("visiting IAASB page", "title", publication.Title, "url", publication.URL)
+
+	// Download the page.
+	responseBody, err := crawler.fetchURL(publication.URL)
+	if err != nil {
+		// Return the HTTP error.
+		return err
+	}
+
+	// Close the page response.
+	defer responseBody.Close()
+
+	// Parse the HTML document.
+	htmlDocument, err := html.Parse(responseBody)
+	if err != nil {
+		// Return the parsing error.
+		return fmt.Errorf("parse IAASB page: %w", err)
+	}
+
+	// Find every PDF on the page.
+	pdfDocuments := findPDFDocuments(htmlDocument, publication.URL)
+
+	// Log how many PDFs were discovered.
+	slog.Info("PDFs found on IAASB page", "title", publication.Title, "count", len(pdfDocuments))
+
+	// Download every PDF immediately.
+	for _, pdfDocument := range pdfDocuments {
+		// Check whether this PDF URL was already processed.
+		if !crawler.markPDFURLProcessed(pdfDocument.URL) {
+			// Log the duplicate URL.
+			slog.Info("PDF URL already processed; skipping", "url", pdfDocument.URL)
+			// Continue with the next PDF.
+			continue
+		}
+
+		// Download the PDF when it is not already available locally.
+		if err := crawler.downloadPDFIfMissing(pdfDocument); err != nil {
+			// Log the download error.
+			slog.Error("failed to download PDF", "url", pdfDocument.URL, "error", err)
+		}
+	}
+
+	// Return successfully.
+	return nil
+}
+
+// findPDFDocuments extracts PDF resources from an IAASB page.
+func findPDFDocuments(htmlDocument *html.Node, sourcePageURL string) []PDFDocument {
+	// Store discovered PDF documents.
+	var pdfDocuments []PDFDocument
+
+	// Prevent duplicate PDF URLs on this page.
+	foundPDFURLs := make(map[string]struct{})
+
+	// Define the recursive HTML tree walker.
+	var walkHTML func(*html.Node)
+
+	// Define the HTML tree walker.
+	walkHTML = func(currentNode *html.Node) {
+		// Stop when there is no node.
+		if currentNode == nil {
+			// Stop processing this branch.
+			return
+		}
+
+		// Inspect anchor elements.
+		if currentNode.Type == html.ElementNode && currentNode.Data == "a" {
+			// Convert HTML attributes into a map.
+			attributes := convertAttributesToMap(currentNode.Attr)
+
+			// Read data-file-url because IAASB commonly uses this attribute for documents.
+			rawPDFURL := strings.TrimSpace(attributes["data-file-url"])
+
+			// Fall back to href when data-file-url is unavailable.
+			if rawPDFURL == "" {
+				// Read the href attribute.
+				rawPDFURL = strings.TrimSpace(attributes["href"])
+			}
+
+			// Ignore empty links.
+			if rawPDFURL != "" {
+				// Resolve the document URL against the source page.
+				absolutePDFURL, resolveError := resolveURL(sourcePageURL, rawPDFURL)
+
+				// Process URLs that look like PDFs or IAASB file resources.
+				if resolveError == nil && isPDFURL(absolutePDFURL) {
+					// Check whether this PDF URL already appeared on this page.
+					if _, exists := foundPDFURLs[absolutePDFURL]; !exists {
+						// Remember the PDF URL.
+						foundPDFURLs[absolutePDFURL] = struct{}{}
+
+						// Create a useful local filename.
+						fileName := createPDFFilename(absolutePDFURL, extractNodeText(currentNode))
+
+						// Add the PDF to the result.
+						pdfDocuments = append(pdfDocuments, PDFDocument{URL: absolutePDFURL, SourcePageURL: sourcePageURL, FileName: fileName})
+					}
+				}
+			}
+		}
+
+		// Walk through every child node.
+		for childNode := currentNode.FirstChild; childNode != nil; childNode = childNode.NextSibling {
+			// Recursively process the child node.
+			walkHTML(childNode)
+		}
+	}
+
+	// Start walking the parsed HTML document.
 	walkHTML(htmlDocument)
 
 	// Return all discovered PDFs.
@@ -489,11 +637,11 @@ func (crawler *IAASBCrawler) downloadPDFIfMissing(pdfDocument PDFDocument) error
 	// Create a SHA-256 hash calculator.
 	fileHash := sha256.New()
 
-	// Copy the PDF into the temporary file while calculating its hash.
+	// Copy the PDF while calculating its SHA-256 hash.
 	if _, err := io.Copy(io.MultiWriter(temporaryFile, fileHash), responseBody); err != nil {
 		// Close the temporary file after the copy fails.
 		_ = temporaryFile.Close()
-		// Return the copy error.
+		// Return the download error.
 		return fmt.Errorf("download PDF: %w", err)
 	}
 
@@ -506,7 +654,7 @@ func (crawler *IAASBCrawler) downloadPDFIfMissing(pdfDocument PDFDocument) error
 	// Convert the hash into a hexadecimal string.
 	pdfHash := hex.EncodeToString(fileHash.Sum(nil))
 
-	// Search the local PDFs directory for identical content.
+	// Search the local PDF directory for identical content.
 	existingFilePath, exists, err := crawler.findPDFByHash(pdfHash)
 	if err != nil {
 		// Return the duplicate detection error.
@@ -521,19 +669,19 @@ func (crawler *IAASBCrawler) downloadPDFIfMissing(pdfDocument PDFDocument) error
 		return nil
 	}
 
-	// Make sure the desired filename does not overwrite another file.
+	// Create a unique filename when another file has the same name.
 	finalFileName := crawler.createUniqueFilename(fileName, pdfHash)
 
 	// Build the final output path.
 	finalFilePath := filepath.Join(crawler.OutputDirectory, finalFileName)
 
-	// Move the temporary file to its final location.
+	// Move the temporary file to the final location.
 	if err := os.Rename(temporaryFilePath, finalFilePath); err != nil {
 		// Return the filesystem error.
 		return fmt.Errorf("save PDF: %w", err)
 	}
 
-	// Log the successful download.
+	// Log the successful PDF download.
 	slog.Info("PDF downloaded", "file", finalFilePath, "sha256", pdfHash)
 
 	// Return successfully.
@@ -553,13 +701,13 @@ func (crawler *IAASBCrawler) findPDFByHash(targetHash string) (string, bool, err
 	for _, entry := range entries {
 		// Ignore directories.
 		if entry.IsDir() {
-			// Continue with the next directory entry.
+			// Continue with the next entry.
 			continue
 		}
 
 		// Ignore files that are not PDFs.
 		if !strings.EqualFold(filepath.Ext(entry.Name()), ".pdf") {
-			// Continue with the next file.
+			// Continue with the next entry.
 			continue
 		}
 
@@ -588,10 +736,10 @@ func (crawler *IAASBCrawler) findPDFByHash(targetHash string) (string, bool, err
 			continue
 		}
 
-		// Convert the existing hash to hexadecimal.
+		// Convert the existing hash into hexadecimal.
 		existingHash := hex.EncodeToString(existingFileHash.Sum(nil))
 
-		// Compare the existing hash with the downloaded PDF hash.
+		// Compare the existing hash with the target hash.
 		if existingHash == targetHash {
 			// Return the duplicate PDF path.
 			return existingFilePath, true, nil
@@ -602,7 +750,7 @@ func (crawler *IAASBCrawler) findPDFByHash(targetHash string) (string, bool, err
 	return "", false, nil
 }
 
-// createUniqueFilename creates a filename that will not overwrite another PDF.
+// createUniqueFilename creates a filename that does not overwrite another PDF.
 func (crawler *IAASBCrawler) createUniqueFilename(fileName string, pdfHash string) string {
 	// Build the initial output path.
 	outputPath := filepath.Join(crawler.OutputDirectory, fileName)
@@ -619,7 +767,7 @@ func (crawler *IAASBCrawler) createUniqueFilename(fileName string, pdfHash strin
 	// Remove the extension from the filename.
 	baseName := strings.TrimSuffix(fileName, fileExtension)
 
-	// Append part of the SHA-256 hash to the filename.
+	// Append part of the SHA-256 hash to avoid overwriting the existing file.
 	return fmt.Sprintf("%s-%s%s", baseName, pdfHash[:12], fileExtension)
 }
 
@@ -657,7 +805,7 @@ func (crawler *IAASBCrawler) fetchURL(rawURL string) (io.ReadCloser, error) {
 	return response.Body, nil
 }
 
-// markPublicationPageVisited marks a publication page as visited.
+// markPublicationPageVisited marks an IAASB page as visited.
 func (crawler *IAASBCrawler) markPublicationPageVisited(publicationURL string) bool {
 	// Lock the crawler state.
 	crawler.Mutex.Lock()
@@ -665,16 +813,16 @@ func (crawler *IAASBCrawler) markPublicationPageVisited(publicationURL string) b
 	// Unlock the crawler state before returning.
 	defer crawler.Mutex.Unlock()
 
-	// Check whether this page has already been visited.
+	// Check whether the page has already been visited.
 	if _, exists := crawler.VisitedPublicationPages[publicationURL]; exists {
 		// Report that the page was already visited.
 		return false
 	}
 
-	// Remember the publication URL.
+	// Remember the page URL.
 	crawler.VisitedPublicationPages[publicationURL] = struct{}{}
 
-	// Report that this is a new publication page.
+	// Report that this is a new page.
 	return true
 }
 
@@ -686,9 +834,9 @@ func (crawler *IAASBCrawler) markPDFURLProcessed(pdfURL string) bool {
 	// Unlock the crawler state before returning.
 	defer crawler.Mutex.Unlock()
 
-	// Check whether this PDF URL was already processed.
+	// Check whether this PDF URL has already been processed.
 	if _, exists := crawler.ProcessedPDFURLs[pdfURL]; exists {
-		// Report that this PDF URL was already processed.
+		// Report that the PDF URL was already processed.
 		return false
 	}
 
@@ -782,14 +930,36 @@ func isIAASBPublicationURL(rawURL string) bool {
 		return false
 	}
 
-	// Accept IAASB publication pages.
-	if strings.HasPrefix(parsedURL.Path, "/publications/") {
-		// Report that this is a valid IAASB publication URL.
-		return true
+	// Only accept IAASB publication paths.
+	return strings.HasPrefix(parsedURL.Path, "/publications/")
+}
+
+// isIAASBMeetingURL checks whether a URL is an IAASB meeting detail page.
+func isIAASBMeetingURL(rawURL string) bool {
+	// Parse the URL.
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		// Reject invalid URLs.
+		return false
 	}
 
-	// Reject all other URLs.
-	return false
+	// Only accept the official IAASB hostname.
+	if !strings.EqualFold(parsedURL.Hostname(), "www.iaasb.org") {
+		// Reject other domains.
+		return false
+	}
+
+	// Read the URL path.
+	meetingPath := strings.TrimSuffix(parsedURL.Path, "/")
+
+	// Reject the Past Meetings listing itself.
+	if meetingPath == "/meetings/past-meetings" {
+		// Reject the listing page.
+		return false
+	}
+
+	// Accept IAASB meeting detail pages.
+	return strings.HasPrefix(meetingPath, "/meetings/") && strings.Count(strings.TrimPrefix(meetingPath, "/meetings/"), "/") == 0
 }
 
 // isPDFURL checks whether a URL represents an IAASB PDF resource.
@@ -804,7 +974,7 @@ func isPDFURL(rawURL string) bool {
 	// Convert the URL path to lowercase.
 	lowercasePath := strings.ToLower(parsedURL.Path)
 
-	// Accept normal URLs ending with .pdf.
+	// Accept normal URLs ending with PDF.
 	if strings.HasSuffix(lowercasePath, ".pdf") {
 		// Report that this is a PDF.
 		return true
