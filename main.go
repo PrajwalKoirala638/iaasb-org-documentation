@@ -47,7 +47,7 @@ import (
 )
 
 // standardsPageURL is the IAASB standards listing URL.
-const standardsPageURL = "https://www.iaasb.org/standards-pronouncements?language=399&page=%d"
+const standardsPageURL = "https://www.iaasb.org/support-resources?language=399&page=%d"
 
 // pdfDirectory is the directory where PDFs will be saved.
 const pdfDirectory = "PDFs"
